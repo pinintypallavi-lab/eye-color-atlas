@@ -14,8 +14,10 @@ interface DetectedColor {
 }
 
 /**
- * Scans the entire canvas pixel-by-pixel to find the darkest circular region,
- * which corresponds to the pupil. Returns canvas coordinates of that center.
+ * Find the pupil center using RING-CONTRAST scoring.
+ * A real pupil is a dark disk surrounded by a lighter iris ring.
+ * Eyebrows, shadows, and eyelashes are dark but have NO lighter ring —
+ * so they score low and are ignored.
  */
 function findPupilCenter(
   pixels: Uint8ClampedArray,
@@ -23,32 +25,50 @@ function findPupilCenter(
   canvasH: number,
 ): { x: number; y: number } {
   const shortSide = Math.min(canvasW, canvasH);
-  // Coarse grid step — ~50 sample points across the shorter dimension
-  const step = Math.max(2, Math.round(shortSide / 50));
-  // Radius used for averaging brightness at each candidate point
-  const sampleR = Math.round(shortSide * 0.04);
+  const step = Math.max(3, Math.round(shortSide / 35));
+  // Pupil radius: ~5% of image short side
+  const pupilR = Math.round(shortSide * 0.05);
+  // Iris search radius: ~18% (covers iris ring well past the pupil)
+  const irisR  = Math.round(shortSide * 0.18);
 
-  let minBrightness = Infinity;
+  let bestScore = -Infinity;
   let bestX = Math.floor(canvasW / 2);
   let bestY = Math.floor(canvasH / 2);
 
-  for (let cy = sampleR; cy < canvasH - sampleR; cy += step) {
-    for (let cx = sampleR; cx < canvasW - sampleR; cx += step) {
-      let total = 0;
-      let count = 0;
-      for (let dy = -sampleR; dy <= sampleR; dy += step) {
-        for (let dx = -sampleR; dx <= sampleR; dx += step) {
+  for (let cy = irisR; cy < canvasH - irisR; cy += step) {
+    for (let cx = irisR; cx < canvasW - irisR; cx += step) {
+      let centerTotal = 0, centerCount = 0;
+      let ringTotal   = 0, ringCount   = 0;
+
+      for (let dy = -irisR; dy <= irisR; dy += step) {
+        for (let dx = -irisR; dx <= irisR; dx += step) {
           const px = cx + dx;
           const py = cy + dy;
           if (px < 0 || px >= canvasW || py < 0 || py >= canvasH) continue;
-          const idx = (py * canvasW + px) * 4;
-          total += (pixels[idx]! + pixels[idx + 1]! + pixels[idx + 2]!) / 3;
-          count++;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const idx  = (py * canvasW + px) * 4;
+          const b    = (pixels[idx]! + pixels[idx + 1]! + pixels[idx + 2]!) / 3;
+
+          if (dist <= pupilR) {
+            centerTotal += b; centerCount++;
+          } else if (dist <= irisR) {
+            ringTotal += b; ringCount++;
+          }
         }
       }
-      const avg = total / (count || 1);
-      if (avg < minBrightness) {
-        minBrightness = avg;
+
+      if (centerCount === 0 || ringCount === 0) continue;
+      const centerAvg = centerTotal / centerCount;
+      const ringAvg   = ringTotal   / ringCount;
+
+      // Require center to be dark (pupil is always dark, < 110)
+      if (centerAvg > 110) continue;
+
+      // Score = brightness contrast: lighter ring vs darker center
+      // Eyebrows/shadows don't have this pattern so score very low
+      const score = ringAvg - centerAvg;
+      if (score > bestScore) {
+        bestScore = score;
         bestX = cx;
         bestY = cy;
       }
@@ -59,8 +79,55 @@ function findPupilCenter(
 }
 
 /**
- * Sample pixels in a donut ring around a fixed center, filtering out
- * the pupil (very dark) and specular reflections (very bright).
+ * Estimate the radius where the iris ends and the sclera (white) begins,
+ * by scanning outward from the pupil center and detecting a sharp brightness jump.
+ * Returns adaptive iris outer radius.
+ */
+function estimateIrisRadius(
+  pixels: Uint8ClampedArray,
+  cx: number,
+  cy: number,
+  canvasW: number,
+  canvasH: number,
+): number {
+  const shortSide = Math.min(canvasW, canvasH);
+  const maxR = Math.round(shortSide * 0.35);
+  const numAngles = 24;
+  const radii: number[] = [];
+
+  for (let i = 0; i < numAngles; i++) {
+    const angle = (i / numAngles) * 2 * Math.PI;
+    const cosA  = Math.cos(angle);
+    const sinA  = Math.sin(angle);
+    let prevB   = -1;
+
+    for (let r = 4; r < maxR; r += 2) {
+      const px = Math.round(cx + r * cosA);
+      const py = Math.round(cy + r * sinA);
+      if (px < 0 || px >= canvasW || py < 0 || py >= canvasH) break;
+      const idx = (py * canvasW + px) * 4;
+      const b   = (pixels[idx]! + pixels[idx + 1]! + pixels[idx + 2]!) / 3;
+
+      // A sharp jump of > 55 brightness units = iris→sclera boundary
+      if (prevB >= 0 && b - prevB > 55) {
+        radii.push(r);
+        break;
+      }
+      prevB = b;
+    }
+  }
+
+  if (radii.length < 6) return Math.round(shortSide * 0.17); // fallback
+
+  radii.sort((a, b) => a - b);
+  // Use the 60th percentile (upper-mid) — avoids eyelid cutoffs on top/bottom
+  return radii[Math.floor(radii.length * 0.6)]!;
+}
+
+/**
+ * Sample pixels in a donut ring around the detected iris center.
+ * Uses adaptive radii from estimateIrisRadius so it stays inside the iris
+ * regardless of image zoom level.
  * Returns the median RGB as a hex string.
  */
 function sampleIrisPixels(
@@ -70,9 +137,11 @@ function sampleIrisPixels(
   canvasW: number,
   canvasH: number,
 ): string {
-  const shortSide = Math.min(canvasW, canvasH);
-  const innerR = Math.round(shortSide * 0.07);  // skip pupil
-  const outerR = Math.round(shortSide * 0.26);  // full iris ring
+  const irisOuter = estimateIrisRadius(pixels, cx, cy, canvasW, canvasH);
+  // Pupil skip: inner 35% of iris radius
+  const innerR = Math.round(irisOuter * 0.35);
+  // Stay within 90% of the detected iris boundary (avoid sclera bleed)
+  const outerR = Math.round(irisOuter * 0.90);
 
   const rs: number[] = [];
   const gs: number[] = [];

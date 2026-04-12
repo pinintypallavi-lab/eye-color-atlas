@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Upload, Camera, Eye, RefreshCw, Info, ArrowLeft, MousePointer, Loader2, Copy, Check } from "lucide-react";
+import { Upload, Camera, Eye, RefreshCw, Info, ArrowLeft, Loader2, Copy, Check, ScanEye } from "lucide-react";
 import { eyeColors } from "@/data/eyeColorData";
 import { Link } from "wouter";
 import EyeIllustration from "@/components/EyeIllustration";
@@ -13,22 +13,66 @@ interface DetectedColor {
   categoryHex: string;
 }
 
-/** Sample pixels in a donut ring around the click point, filtering out
- *  pupil (very dark) and specular reflections (very bright).
- *  Returns the median RGB as a hex string.
+/**
+ * Scans the entire canvas pixel-by-pixel to find the darkest circular region,
+ * which corresponds to the pupil. Returns canvas coordinates of that center.
+ */
+function findPupilCenter(
+  pixels: Uint8ClampedArray,
+  canvasW: number,
+  canvasH: number,
+): { x: number; y: number } {
+  const shortSide = Math.min(canvasW, canvasH);
+  // Coarse grid step — ~50 sample points across the shorter dimension
+  const step = Math.max(2, Math.round(shortSide / 50));
+  // Radius used for averaging brightness at each candidate point
+  const sampleR = Math.round(shortSide * 0.04);
+
+  let minBrightness = Infinity;
+  let bestX = Math.floor(canvasW / 2);
+  let bestY = Math.floor(canvasH / 2);
+
+  for (let cy = sampleR; cy < canvasH - sampleR; cy += step) {
+    for (let cx = sampleR; cx < canvasW - sampleR; cx += step) {
+      let total = 0;
+      let count = 0;
+      for (let dy = -sampleR; dy <= sampleR; dy += step) {
+        for (let dx = -sampleR; dx <= sampleR; dx += step) {
+          const px = cx + dx;
+          const py = cy + dy;
+          if (px < 0 || px >= canvasW || py < 0 || py >= canvasH) continue;
+          const idx = (py * canvasW + px) * 4;
+          total += (pixels[idx]! + pixels[idx + 1]! + pixels[idx + 2]!) / 3;
+          count++;
+        }
+      }
+      const avg = total / (count || 1);
+      if (avg < minBrightness) {
+        minBrightness = avg;
+        bestX = cx;
+        bestY = cy;
+      }
+    }
+  }
+
+  return { x: bestX, y: bestY };
+}
+
+/**
+ * Sample pixels in a donut ring around a fixed center, filtering out
+ * the pupil (very dark) and specular reflections (very bright).
+ * Returns the median RGB as a hex string.
  */
 function sampleIrisPixels(
-  ctx: CanvasRenderingContext2D,
+  pixels: Uint8ClampedArray,
   cx: number,
   cy: number,
   canvasW: number,
   canvasH: number,
 ): string {
   const shortSide = Math.min(canvasW, canvasH);
-  // Inner ring starts at 12% of short side to skip the pupil centre
-  const innerR = Math.round(shortSide * 0.06);
-  // Outer ring goes to 30% — covers most of the iris
-  const outerR = Math.round(shortSide * 0.22);
+  const innerR = Math.round(shortSide * 0.07);  // skip pupil
+  const outerR = Math.round(shortSide * 0.26);  // full iris ring
 
   const rs: number[] = [];
   const gs: number[] = [];
@@ -39,10 +83,6 @@ function sampleIrisPixels(
   const x1 = Math.min(canvasW - 1, Math.round(cx + outerR));
   const y1 = Math.min(canvasH - 1, Math.round(cy + outerR));
 
-  const imageData = ctx.getImageData(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-  const data = imageData.data;
-  const w = x1 - x0 + 1;
-
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
       const dx = x - cx;
@@ -50,14 +90,14 @@ function sampleIrisPixels(
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist < innerR || dist > outerR) continue;
 
-      const idx = ((y - y0) * w + (x - x0)) * 4;
-      const r = data[idx]!;
-      const g = data[idx + 1]!;
-      const b = data[idx + 2]!;
+      const idx = (y * canvasW + x) * 4;
+      const r = pixels[idx]!;
+      const g = pixels[idx + 1]!;
+      const b = pixels[idx + 2]!;
 
-      // Skip very dark pixels (pupil / shadow) and very bright (reflections)
       const brightness = (r + g + b) / 3;
-      if (brightness < 25 || brightness > 230) continue;
+      // Skip very dark pixels (pupil/shadow) and very bright (reflections/sclera)
+      if (brightness < 30 || brightness > 220) continue;
 
       rs.push(r);
       gs.push(g);
@@ -65,29 +105,26 @@ function sampleIrisPixels(
     }
   }
 
-  if (rs.length === 0) return "#7B4F32"; // fallback
+  if (rs.length < 10) return "#7B4F32"; // fallback if too few pixels found
 
   rs.sort((a, b) => a - b);
   gs.sort((a, b) => a - b);
   bs.sort((a, b) => a - b);
 
   const mid = Math.floor(rs.length / 2);
-  const r = rs[mid]!;
-  const g = gs[mid]!;
-  const b = bs[mid]!;
-
-  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
+  const toHex = (n: number) => n.toString(16).padStart(2, "0");
+  return `#${toHex(rs[mid]!)}${toHex(gs[mid]!)}${toHex(bs[mid]!)}`;
 }
 
-/** Crop a region around the click and return a base64 JPEG data URL */
-function cropRegion(canvas: HTMLCanvasElement, px: number, py: number): string {
+/** Crop a 512×512 region around the detected iris center for AI naming */
+function cropIrisRegion(canvas: HTMLCanvasElement, cx: number, cy: number): string {
   const shortSide = Math.min(canvas.width, canvas.height);
-  const half = Math.min(Math.floor(shortSide * 0.35), 400);
+  const half = Math.min(Math.round(shortSide * 0.32), 400);
 
-  const x0 = Math.max(0, Math.round(px - half));
-  const y0 = Math.max(0, Math.round(py - half));
-  const x1 = Math.min(canvas.width, Math.round(px + half));
-  const y1 = Math.min(canvas.height, Math.round(py + half));
+  const x0 = Math.max(0, Math.round(cx - half));
+  const y0 = Math.max(0, Math.round(cy - half));
+  const x1 = Math.min(canvas.width, Math.round(cx + half));
+  const y1 = Math.min(canvas.height, Math.round(cy + half));
   const w = x1 - x0;
   const h = y1 - y0;
 
@@ -96,8 +133,7 @@ function cropRegion(canvas: HTMLCanvasElement, px: number, py: number): string {
   const scale = Math.min(1, maxDim / Math.max(w, h));
   crop.width = Math.round(w * scale);
   crop.height = Math.round(h * scale);
-  const ctx = crop.getContext("2d")!;
-  ctx.drawImage(canvas, x0, y0, w, h, 0, 0, crop.width, crop.height);
+  crop.getContext("2d")!.drawImage(canvas, x0, y0, w, h, 0, 0, crop.width, crop.height);
   return crop.toDataURL("image/jpeg", 0.92);
 }
 
@@ -105,7 +141,6 @@ function toHex2(n: number) {
   return n.toString(16).padStart(2, "0");
 }
 
-/** Lighten a hex color slightly for the swatch gradient */
 function lightenHex(hex: string, amount: number): string {
   const r = Math.min(255, parseInt(hex.slice(1, 3), 16) + amount);
   const g = Math.min(255, parseInt(hex.slice(3, 5), 16) + amount);
@@ -115,14 +150,12 @@ function lightenHex(hex: string, amount: number): string {
 
 function HexCopyButton({ hex }: { hex: string }) {
   const [copied, setCopied] = useState(false);
-
   const copy = (e: React.MouseEvent) => {
     e.stopPropagation();
     navigator.clipboard.writeText(hex.toUpperCase()).catch(() => {});
     setCopied(true);
     setTimeout(() => setCopied(false), 1800);
   };
-
   return (
     <div
       onClick={copy}
@@ -133,10 +166,7 @@ function HexCopyButton({ hex }: { hex: string }) {
       style={{ borderColor: hex, color: hex, background: hex + "18" }}
       title="Copy hex code"
     >
-      <span
-        className="w-4 h-4 rounded-full border-2 border-white shadow-sm flex-shrink-0"
-        style={{ backgroundColor: hex }}
-      />
+      <span className="w-4 h-4 rounded-full border-2 border-white shadow-sm flex-shrink-0" style={{ backgroundColor: hex }} />
       {hex.toUpperCase()}
       {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5 opacity-60" />}
     </div>
@@ -146,37 +176,96 @@ function HexCopyButton({ hex }: { hex: string }) {
 export default function UploadPage() {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [result, setResult] = useState<DetectedColor | null>(null);
-  const [clickPos, setClickPos] = useState<{ x: number; y: number } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  // Detected iris center in display (CSS) coordinates — for the overlay dot
+  const [irisCenter, setIrisCenter] = useState<{ x: number; y: number } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
 
-  const handleFile = useCallback((file: File) => {
-    if (!file.type.match(/^image\/(jpeg|jpg|png|webp)$/)) {
-      alert("Please upload a JPG, PNG, or WebP image.");
-      return;
-    }
-    const url = URL.createObjectURL(file);
-    setImageUrl(url);
-    setResult(null);
-    setClickPos(null);
-    setError(null);
+  /**
+   * Core analysis routine. Always uses the auto-detected iris center,
+   * so the color never changes regardless of where the user clicks.
+   */
+  const analyzeImage = useCallback(async (canvas: HTMLCanvasElement) => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
-    const img = new Image();
-    img.onload = () => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext("2d");
-      ctx?.drawImage(img, 0, 0);
-    };
-    img.src = url;
+    setResult(null);
+    setError(null);
+    setIsLoading(true);
+
+    try {
+      // Step 1: Get all pixel data once
+      const fullData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const pixels = fullData.data;
+
+      // Step 2: Auto-detect the pupil/iris center
+      const { x: pupilX, y: pupilY } = findPupilCenter(pixels, canvas.width, canvas.height);
+
+      // Convert canvas coords → display coords for the overlay dot
+      const img = imgRef.current;
+      if (img) {
+        const rect = img.getBoundingClientRect();
+        const displayX = (pupilX / canvas.width) * rect.width;
+        const displayY = (pupilY / canvas.height) * rect.height;
+        setIrisCenter({ x: displayX, y: displayY });
+      }
+
+      // Step 3: Sample the iris ring around the auto-detected center
+      const sampledHex = sampleIrisPixels(pixels, pupilX, pupilY, canvas.width, canvas.height);
+
+      // Step 4: Crop region around iris and send to AI for descriptive name
+      const imageData = cropIrisRegion(canvas, pupilX, pupilY);
+
+      const res = await fetch("/api/analyze-eye", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageData, sampledHex }),
+      });
+
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      const data = (await res.json()) as DetectedColor;
+      setResult(data);
+    } catch (err) {
+      console.error(err);
+      setError("Could not detect eye colour. Please use a clear, close-up eye photo.");
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
+
+  const handleFile = useCallback(
+    (file: File) => {
+      if (!file.type.match(/^image\/(jpeg|jpg|png|webp)$/)) {
+        alert("Please upload a JPG, PNG, or WebP image.");
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      setImageUrl(url);
+      setResult(null);
+      setIrisCenter(null);
+      setError(null);
+
+      const img = new Image();
+      img.onload = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0);
+        // Auto-analyze immediately once image is painted
+        analyzeImage(canvas);
+      };
+      img.src = url;
+    },
+    [analyzeImage],
+  );
 
   const onDrop = useCallback(
     (e: React.DragEvent) => {
@@ -188,61 +277,17 @@ export default function UploadPage() {
     [handleFile],
   );
 
-  const handleImageClick = useCallback(
-    async (e: React.MouseEvent<HTMLDivElement>) => {
-      const canvas = canvasRef.current;
-      const img = imgRef.current;
-      if (!canvas || !img || isLoading) return;
-
-      const rect = img.getBoundingClientRect();
-      const displayX = e.clientX - rect.left;
-      const displayY = e.clientY - rect.top;
-
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      const canvasX = displayX * scaleX;
-      const canvasY = displayY * scaleY;
-
-      setClickPos({ x: displayX, y: displayY });
-      setResult(null);
-      setError(null);
-      setIsLoading(true);
-
-      try {
-        // Step 1: Sample real pixels from the iris area for the exact hex
-        const ctx = canvas.getContext("2d");
-        const sampledHex = ctx
-          ? sampleIrisPixels(ctx, canvasX, canvasY, canvas.width, canvas.height)
-          : "#7B4F32";
-
-        // Step 2: Crop the region and send to AI for descriptive name + category
-        const imageData = cropRegion(canvas, canvasX, canvasY);
-
-        const res = await fetch("/api/analyze-eye", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ imageData, sampledHex }),
-        });
-
-        if (!res.ok) throw new Error(`Server error ${res.status}`);
-        const data = (await res.json()) as DetectedColor;
-        setResult(data);
-      } catch (err) {
-        console.error(err);
-        setError("Could not detect eye colour. Try clicking directly on the iris.");
-      } finally {
-        setIsLoading(false);
-      }
-    },
-    [isLoading],
-  );
-
   const reset = () => {
     setImageUrl(null);
     setResult(null);
-    setClickPos(null);
+    setIrisCenter(null);
     setError(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const reanalyze = () => {
+    const canvas = canvasRef.current;
+    if (canvas && !isLoading) analyzeImage(canvas);
   };
 
   const matchedColor = result ? eyeColors.find((c) => c.id === result.id) : null;
@@ -261,20 +306,13 @@ export default function UploadPage() {
               <Camera className="w-5 h-5 text-gray-700" />
               <h1 className="text-xl font-black text-gray-900">AI Iris Analysis — Exact Eye Colour Detection</h1>
             </div>
-            <p className="text-gray-400 text-sm">Pixel-precise colour · Powered by GPT-4o Vision · Upload a photo · Click on the iris</p>
+            <p className="text-gray-400 text-sm">Pixel-precise colour · Powered by GPT-4o Vision · Auto-detects iris automatically</p>
           </div>
-
           <div className="p-6">
             <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-4">Reference Eye Colors</p>
             <div className="flex flex-wrap gap-2">
               {eyeColors.map((ec) => (
-                <EyeIllustration
-                  key={ec.id}
-                  irisColor={ec.hex}
-                  size={70}
-                  selected={result?.id === ec.id}
-                  label={ec.name}
-                />
+                <EyeIllustration key={ec.id} irisColor={ec.hex} size={70} selected={result?.id === ec.id} label={ec.name} />
               ))}
             </div>
           </div>
@@ -287,7 +325,7 @@ export default function UploadPage() {
         <div className="flex items-start gap-3 bg-blue-50 border border-blue-200 rounded-2xl p-4 mb-6 text-sm text-blue-700">
           <Info className="w-5 h-5 flex-shrink-0 mt-0.5 text-blue-500" />
           <div>
-            <strong>How it works:</strong> Click directly on the iris. The app reads the actual pixel colours from your image to get the precise hex, then GPT-4o names the shade. Click again to re-sample.
+            <strong>Auto-detection:</strong> The app automatically finds and scans the iris in your photo — no need to click precisely. Upload any clear eye photo and it detects the exact colour instantly.
           </div>
         </div>
 
@@ -295,10 +333,7 @@ export default function UploadPage() {
           {!imageUrl ? (
             <motion.div key="upload" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <div
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  setIsDragging(true);
-                }}
+                onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
                 onDragLeave={() => setIsDragging(false)}
                 onDrop={onDrop}
                 onClick={() => fileInputRef.current?.click()}
@@ -309,29 +344,23 @@ export default function UploadPage() {
                 <Upload className="w-12 h-12 text-orange-400 mx-auto mb-4" />
                 <p className="text-xl font-semibold text-gray-800 mb-2">Drop your eye image here</p>
                 <p className="text-gray-400 text-sm mb-2">or click to browse</p>
-                <p className="text-xs text-gray-300">Supports JPG, PNG, WebP — any eye photo works</p>
+                <p className="text-xs text-gray-300">Supports JPG, PNG, WebP — any clear eye photo works</p>
                 <input
                   ref={fileInputRef}
                   type="file"
                   accept="image/jpeg,image/jpg,image/png,image/webp"
                   className="hidden"
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) handleFile(f);
-                  }}
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
                 />
               </div>
             </motion.div>
           ) : (
             <motion.div key="result" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-5">
               <div className="grid md:grid-cols-2 gap-5">
-                {/* Image with click target */}
+
+                {/* Image panel */}
                 <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
-                  <div
-                    className="relative"
-                    style={{ cursor: isLoading ? "wait" : "crosshair" }}
-                    onClick={handleImageClick}
-                  >
+                  <div className="relative">
                     <img
                       ref={imgRef}
                       src={imageUrl}
@@ -340,10 +369,11 @@ export default function UploadPage() {
                       draggable={false}
                     />
 
-                    {clickPos && (
+                    {/* Detected iris center dot */}
+                    {irisCenter && (
                       <div
                         className="absolute pointer-events-none"
-                        style={{ left: clickPos.x, top: clickPos.y, transform: "translate(-50%, -50%)" }}
+                        style={{ left: irisCenter.x, top: irisCenter.y, transform: "translate(-50%, -50%)" }}
                       >
                         {isLoading ? (
                           <div className="w-10 h-10 rounded-full bg-white/90 shadow-lg flex items-center justify-center">
@@ -352,23 +382,24 @@ export default function UploadPage() {
                         ) : (
                           <>
                             <div
-                              className="w-8 h-8 rounded-full border-4 border-white shadow-lg animate-ping absolute inset-0 opacity-50"
-                              style={{ borderColor: result?.hex ?? "white" }}
+                              className="w-10 h-10 rounded-full border-4 border-white shadow-lg animate-ping absolute inset-0 opacity-40"
+                              style={{ borderColor: result?.hex ?? "#f97316" }}
                             />
                             <div
-                              className="w-8 h-8 rounded-full border-4 border-white shadow-lg relative z-10"
-                              style={{ backgroundColor: result?.hex ?? "white" }}
+                              className="w-10 h-10 rounded-full border-4 border-white shadow-lg relative z-10"
+                              style={{ backgroundColor: result?.hex ?? "#f97316" }}
                             />
                           </>
                         )}
                       </div>
                     )}
 
-                    {!clickPos && (
+                    {/* Scanning overlay while loading */}
+                    {isLoading && !irisCenter && (
                       <div className="absolute inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[1px] pointer-events-none">
                         <div className="bg-white/95 rounded-2xl px-5 py-3 shadow-lg flex items-center gap-2 text-sm font-semibold text-gray-800">
-                          <MousePointer className="w-4 h-4 text-orange-500" />
-                          Click on the iris to detect exact colour
+                          <ScanEye className="w-4 h-4 text-orange-500 animate-pulse" />
+                          Auto-detecting iris…
                         </div>
                       </div>
                     )}
@@ -376,16 +407,29 @@ export default function UploadPage() {
 
                   <div className="p-4 flex items-center justify-between">
                     <p className="text-gray-400 text-sm">
-                      {isLoading ? "Sampling pixels & naming with AI…" : clickPos ? "Click again to re-sample" : "Waiting for click"}
+                      {isLoading ? "Scanning pixels & naming with AI…" : irisCenter ? "Iris auto-detected" : ""}
                     </p>
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      onClick={reset}
-                      onKeyDown={(e) => e.key === "Enter" && reset()}
-                      className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-700 transition cursor-pointer"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" /> New image
+                    <div className="flex items-center gap-3">
+                      {!isLoading && result && (
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          onClick={reanalyze}
+                          onKeyDown={(e) => e.key === "Enter" && reanalyze()}
+                          className="flex items-center gap-1.5 text-xs text-orange-500 hover:text-orange-700 transition cursor-pointer font-semibold"
+                        >
+                          <ScanEye className="w-3.5 h-3.5" /> Re-scan
+                        </div>
+                      )}
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={reset}
+                        onKeyDown={(e) => e.key === "Enter" && reset()}
+                        className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-700 transition cursor-pointer"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" /> New image
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -399,8 +443,8 @@ export default function UploadPage() {
                   {isLoading && !result && (
                     <div className="bg-white border border-gray-200 rounded-3xl shadow-sm p-10 flex flex-col items-center justify-center text-center flex-1 min-h-64">
                       <Loader2 className="w-10 h-10 text-orange-400 animate-spin mb-4" />
-                      <p className="text-gray-700 font-semibold">Reading iris pixels…</p>
-                      <p className="text-gray-400 text-sm mt-1">Getting exact colour from your image</p>
+                      <p className="text-gray-700 font-semibold">Scanning iris pixels…</p>
+                      <p className="text-gray-400 text-sm mt-1">Auto-locating iris and reading exact colour</p>
                     </div>
                   )}
 
@@ -426,35 +470,27 @@ export default function UploadPage() {
                             style={{ backgroundColor: result.hex }}
                           />
                           <div>
-                            <p className="text-white text-xs font-semibold tracking-widest uppercase opacity-80">
-                              Exact Iris Colour
-                            </p>
+                            <p className="text-white text-xs font-semibold tracking-widest uppercase opacity-80">Exact Iris Colour</p>
                             <p className="text-white font-mono text-sm font-bold">{result.hex.toUpperCase()}</p>
                           </div>
                         </div>
                       </div>
 
                       <div className="px-6 pt-5 pb-2 text-center">
-                        {/* Descriptive name from AI */}
                         <h2 className="text-2xl font-black text-gray-900 mb-0.5">{result.exactName}</h2>
                         <p className="text-sm text-gray-400 mb-4">Category: {result.name}</p>
-
-                        {/* Copyable hex badge */}
                         <div className="flex justify-center mb-5">
                           <HexCopyButton hex={result.hex} />
                         </div>
-
-                        {/* Eye illustration with exact colour */}
                         <div className="flex justify-center mb-3">
                           <EyeIllustration irisColor={result.hex} size={110} selected />
                         </div>
-
                         <div
                           className="inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-bold text-white shadow-sm mb-5"
                           style={{ backgroundColor: result.hex }}
                         >
                           <Eye className="w-4 h-4" />
-                          Pixel-sampled · Named by GPT-4o
+                          Auto-detected · Named by GPT-4o
                         </div>
                       </div>
 
@@ -464,21 +500,15 @@ export default function UploadPage() {
                           <div className="space-y-2 text-sm text-gray-600 mb-4">
                             <div className="flex items-center gap-2">
                               <span className="text-lg">{matchedColor.mainCountryFlag}</span>
-                              <span>
-                                Most common in <strong>{matchedColor.mainCountry}</strong> ({matchedColor.mainCountryPercentage}%)
-                              </span>
+                              <span>Most common in <strong>{matchedColor.mainCountry}</strong> ({matchedColor.mainCountryPercentage}%)</span>
                             </div>
                             <div className="flex items-center gap-2">
                               <span>🌍</span>
-                              <span>
-                                <strong>{matchedColor.globalPrevalence}</strong> of world population
-                              </span>
+                              <span><strong>{matchedColor.globalPrevalence}</strong> of world population</span>
                             </div>
                             <div className="flex items-center gap-2">
                               <span>🧬</span>
-                              <span>
-                                Melanin: <strong>{matchedColor.melaninLevel}</strong>
-                              </span>
+                              <span>Melanin: <strong>{matchedColor.melaninLevel}</strong></span>
                             </div>
                           </div>
                           <Link href={`/eye/${result.id}`}>
@@ -497,16 +527,16 @@ export default function UploadPage() {
 
                   {!result && !isLoading && !error && (
                     <div className="bg-white border border-gray-200 rounded-3xl shadow-sm p-10 flex flex-col items-center justify-center text-center flex-1 min-h-64">
-                      <MousePointer className="w-10 h-10 text-gray-200 mb-3" />
-                      <p className="text-gray-500 font-semibold">Click on the iris</p>
-                      <p className="text-gray-300 text-sm mt-1">in the image on the left</p>
+                      <ScanEye className="w-10 h-10 text-gray-200 mb-3" />
+                      <p className="text-gray-500 font-semibold">Ready to scan</p>
+                      <p className="text-gray-300 text-sm mt-1">Upload an eye photo to auto-detect iris colour</p>
                     </div>
                   )}
                 </div>
               </div>
 
               <p className="text-center text-xs text-gray-400">
-                Pixels are sampled directly from your image for the exact hex · GPT-4o names the shade · Click anywhere on the iris
+                Iris is auto-located from the image · Pixels sampled for exact hex · GPT-4o names the shade
               </p>
             </motion.div>
           )}

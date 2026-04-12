@@ -401,8 +401,25 @@ export default function UploadPage() {
                       </div>
 
                       <div className="px-6 pt-5 pb-2 text-center">
-                        <h2 className="text-2xl font-black text-gray-900 mb-0.5">{result.exactName}</h2>
-                        <p className="text-sm text-gray-400 mb-4">Category: {result.name}</p>
+                        <h2 className="text-2xl font-black text-gray-900 mb-2">{result.exactName}</h2>
+
+                        {/* Category colour highlight */}
+                        <div className="flex items-center justify-center gap-2 mb-5">
+                          <div
+                            className="flex items-center gap-2 px-4 py-2 rounded-full border-2 font-bold text-sm"
+                            style={{
+                              borderColor: result.categoryHex,
+                              backgroundColor: result.categoryHex + "22",
+                              color: result.categoryHex,
+                            }}
+                          >
+                            <span
+                              className="w-4 h-4 rounded-full border-2 border-white shadow"
+                              style={{ backgroundColor: result.categoryHex }}
+                            />
+                            {result.name} Eye
+                          </div>
+                        </div>
                         <div className="flex justify-center mb-5">
                           <HexCopyButton hex={result.hex} />
                         </div>

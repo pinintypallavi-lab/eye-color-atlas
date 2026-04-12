@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Upload, Camera, Eye, RefreshCw, Info, ArrowLeft, Loader2, Copy, Check, ScanEye } from "lucide-react";
+import { Upload, Camera, Eye, RefreshCw, Info, ArrowLeft, Loader2, Copy, Check, MousePointer } from "lucide-react";
 import { eyeColors } from "@/data/eyeColorData";
 import { Link } from "wouter";
 import EyeIllustration from "@/components/EyeIllustration";
@@ -14,58 +14,70 @@ interface DetectedColor {
 }
 
 /**
- * Find the pupil center using RING-CONTRAST scoring.
- * A real pupil is a dark disk surrounded by a lighter iris ring.
- * Eyebrows, shadows, and eyelashes are dark but have NO lighter ring —
- * so they score low and are ignored.
+ * Within a LOCAL search area around the user's click, find the best pupil center
+ * using ring-contrast scoring: a true pupil is a dark disk surrounded by a
+ * lighter iris ring. Eyebrows, eyelashes, and shadows are dark but have
+ * no lighter ring, so they score near zero and are ignored.
+ *
+ * searchR controls how far from the click we look for the pupil center.
  */
-function findPupilCenter(
+function findLocalPupilCenter(
   pixels: Uint8ClampedArray,
+  clickX: number,
+  clickY: number,
   canvasW: number,
   canvasH: number,
 ): { x: number; y: number } {
   const shortSide = Math.min(canvasW, canvasH);
-  const step = Math.max(3, Math.round(shortSide / 35));
-  // Pupil radius: ~5% of image short side
-  const pupilR = Math.round(shortSide * 0.05);
-  // Iris search radius: ~18% (covers iris ring well past the pupil)
-  const irisR  = Math.round(shortSide * 0.18);
+
+  // Pupil radius assumption: ~5% of image short side
+  const pupilR  = Math.round(shortSide * 0.05);
+  // Iris ring extends to ~16% of image short side from center
+  const irisR   = Math.round(shortSide * 0.16);
+  // How far from the click to search for the pupil center
+  const searchR = Math.round(shortSide * 0.20);
+  // Grid step for candidate points
+  const step    = Math.max(2, Math.round(shortSide / 45));
 
   let bestScore = -Infinity;
-  let bestX = Math.floor(canvasW / 2);
-  let bestY = Math.floor(canvasH / 2);
+  let bestX = clickX;
+  let bestY = clickY;
 
-  for (let cy = irisR; cy < canvasH - irisR; cy += step) {
-    for (let cx = irisR; cx < canvasW - irisR; cx += step) {
-      let centerTotal = 0, centerCount = 0;
-      let ringTotal   = 0, ringCount   = 0;
+  const x0 = Math.max(irisR, Math.round(clickX - searchR));
+  const y0 = Math.max(irisR, Math.round(clickY - searchR));
+  const x1 = Math.min(canvasW - irisR - 1, Math.round(clickX + searchR));
+  const y1 = Math.min(canvasH - irisR - 1, Math.round(clickY + searchR));
+
+  for (let cy = y0; cy <= y1; cy += step) {
+    for (let cx = x0; cx <= x1; cx += step) {
+      let centerSum = 0, centerN = 0;
+      let ringSum   = 0, ringN   = 0;
 
       for (let dy = -irisR; dy <= irisR; dy += step) {
         for (let dx = -irisR; dx <= irisR; dx += step) {
           const px = cx + dx;
           const py = cy + dy;
           if (px < 0 || px >= canvasW || py < 0 || py >= canvasH) continue;
+
           const dist = Math.sqrt(dx * dx + dy * dy);
           const idx  = (py * canvasW + px) * 4;
           const b    = (pixels[idx]! + pixels[idx + 1]! + pixels[idx + 2]!) / 3;
 
           if (dist <= pupilR) {
-            centerTotal += b; centerCount++;
+            centerSum += b; centerN++;
           } else if (dist <= irisR) {
-            ringTotal += b; ringCount++;
+            ringSum += b; ringN++;
           }
         }
       }
 
-      if (centerCount === 0 || ringCount === 0) continue;
-      const centerAvg = centerTotal / centerCount;
-      const ringAvg   = ringTotal   / ringCount;
+      if (centerN === 0 || ringN === 0) continue;
+      const centerAvg = centerSum / centerN;
+      const ringAvg   = ringSum   / ringN;
 
-      // Require center to be dark (pupil is always dark, < 110)
-      if (centerAvg > 110) continue;
+      // Pupil must be fairly dark — reject skin/sclera highlights
+      if (centerAvg > 115) continue;
 
-      // Score = brightness contrast: lighter ring vs darker center
-      // Eyebrows/shadows don't have this pattern so score very low
       const score = ringAvg - centerAvg;
       if (score > bestScore) {
         bestScore = score;
@@ -79,9 +91,9 @@ function findPupilCenter(
 }
 
 /**
- * Estimate the radius where the iris ends and the sclera (white) begins,
- * by scanning outward from the pupil center and detecting a sharp brightness jump.
- * Returns adaptive iris outer radius.
+ * Scan outward from the pupil center in multiple directions to find
+ * where the iris meets the sclera (sharp brightness jump).
+ * Returns the adaptive iris outer radius.
  */
 function estimateIrisRadius(
   pixels: Uint8ClampedArray,
@@ -91,7 +103,7 @@ function estimateIrisRadius(
   canvasH: number,
 ): number {
   const shortSide = Math.min(canvasW, canvasH);
-  const maxR = Math.round(shortSide * 0.35);
+  const maxR = Math.round(shortSide * 0.30);
   const numAngles = 24;
   const radii: number[] = [];
 
@@ -108,7 +120,7 @@ function estimateIrisRadius(
       const idx = (py * canvasW + px) * 4;
       const b   = (pixels[idx]! + pixels[idx + 1]! + pixels[idx + 2]!) / 3;
 
-      // A sharp jump of > 55 brightness units = iris→sclera boundary
+      // Sharp brightness jump > 55 = iris→sclera boundary
       if (prevB >= 0 && b - prevB > 55) {
         radii.push(r);
         break;
@@ -117,18 +129,17 @@ function estimateIrisRadius(
     }
   }
 
-  if (radii.length < 6) return Math.round(shortSide * 0.17); // fallback
+  if (radii.length < 6) return Math.round(shortSide * 0.15); // fallback
 
   radii.sort((a, b) => a - b);
-  // Use the 60th percentile (upper-mid) — avoids eyelid cutoffs on top/bottom
+  // 60th percentile avoids eyelid cutoffs top/bottom
   return radii[Math.floor(radii.length * 0.6)]!;
 }
 
 /**
- * Sample pixels in a donut ring around the detected iris center.
- * Uses adaptive radii from estimateIrisRadius so it stays inside the iris
- * regardless of image zoom level.
- * Returns the median RGB as a hex string.
+ * Sample a donut ring of iris pixels around the detected pupil center.
+ * Uses adaptive radii — stays strictly inside the iris ring.
+ * Returns the median RGB as a CSS hex string.
  */
 function sampleIrisPixels(
   pixels: Uint8ClampedArray,
@@ -138,10 +149,8 @@ function sampleIrisPixels(
   canvasH: number,
 ): string {
   const irisOuter = estimateIrisRadius(pixels, cx, cy, canvasW, canvasH);
-  // Pupil skip: inner 35% of iris radius
-  const innerR = Math.round(irisOuter * 0.35);
-  // Stay within 90% of the detected iris boundary (avoid sclera bleed)
-  const outerR = Math.round(irisOuter * 0.90);
+  const innerR    = Math.round(irisOuter * 0.38); // skip pupil
+  const outerR    = Math.round(irisOuter * 0.88); // stay inside iris
 
   const rs: number[] = [];
   const gs: number[] = [];
@@ -154,67 +163,56 @@ function sampleIrisPixels(
 
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
-      const dx = x - cx;
-      const dy = y - cy;
-      const dist = Math.sqrt(dx * dx + dy * dy);
+      const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
       if (dist < innerR || dist > outerR) continue;
 
       const idx = (y * canvasW + x) * 4;
-      const r = pixels[idx]!;
-      const g = pixels[idx + 1]!;
-      const b = pixels[idx + 2]!;
+      const r   = pixels[idx]!;
+      const g   = pixels[idx + 1]!;
+      const b   = pixels[idx + 2]!;
+      const bri = (r + g + b) / 3;
 
-      const brightness = (r + g + b) / 3;
-      // Skip very dark pixels (pupil/shadow) and very bright (reflections/sclera)
-      if (brightness < 30 || brightness > 220) continue;
+      // Exclude very dark (pupil/shadow) and very bright (reflection/sclera)
+      if (bri < 28 || bri > 225) continue;
 
-      rs.push(r);
-      gs.push(g);
-      bs.push(b);
+      rs.push(r); gs.push(g); bs.push(b);
     }
   }
 
-  if (rs.length < 10) return "#7B4F32"; // fallback if too few pixels found
+  if (rs.length < 8) return "#7B4F32"; // fallback
 
   rs.sort((a, b) => a - b);
   gs.sort((a, b) => a - b);
   bs.sort((a, b) => a - b);
 
   const mid = Math.floor(rs.length / 2);
-  const toHex = (n: number) => n.toString(16).padStart(2, "0");
-  return `#${toHex(rs[mid]!)}${toHex(gs[mid]!)}${toHex(bs[mid]!)}`;
+  const h   = (n: number) => n.toString(16).padStart(2, "0");
+  return `#${h(rs[mid]!)}${h(gs[mid]!)}${h(bs[mid]!)}`;
 }
 
-/** Crop a 512×512 region around the detected iris center for AI naming */
+/** Crop a region around the iris center and return a base64 JPEG for AI naming */
 function cropIrisRegion(canvas: HTMLCanvasElement, cx: number, cy: number): string {
   const shortSide = Math.min(canvas.width, canvas.height);
-  const half = Math.min(Math.round(shortSide * 0.32), 400);
+  const half = Math.min(Math.round(shortSide * 0.30), 380);
 
   const x0 = Math.max(0, Math.round(cx - half));
   const y0 = Math.max(0, Math.round(cy - half));
-  const x1 = Math.min(canvas.width, Math.round(cx + half));
+  const x1 = Math.min(canvas.width,  Math.round(cx + half));
   const y1 = Math.min(canvas.height, Math.round(cy + half));
-  const w = x1 - x0;
-  const h = y1 - y0;
+  const w = x1 - x0, h = y1 - y0;
 
-  const crop = document.createElement("canvas");
-  const maxDim = 512;
-  const scale = Math.min(1, maxDim / Math.max(w, h));
-  crop.width = Math.round(w * scale);
+  const crop  = document.createElement("canvas");
+  const scale = Math.min(1, 512 / Math.max(w, h));
+  crop.width  = Math.round(w * scale);
   crop.height = Math.round(h * scale);
   crop.getContext("2d")!.drawImage(canvas, x0, y0, w, h, 0, 0, crop.width, crop.height);
   return crop.toDataURL("image/jpeg", 0.92);
 }
 
-function toHex2(n: number) {
-  return n.toString(16).padStart(2, "0");
-}
-
 function lightenHex(hex: string, amount: number): string {
-  const r = Math.min(255, parseInt(hex.slice(1, 3), 16) + amount);
-  const g = Math.min(255, parseInt(hex.slice(3, 5), 16) + amount);
-  const b = Math.min(255, parseInt(hex.slice(5, 7), 16) + amount);
-  return `#${toHex2(r)}${toHex2(g)}${toHex2(b)}`;
+  const h = (s: number, e: number) => Math.min(255, parseInt(hex.slice(s, e), 16) + amount);
+  const t = (n: number) => n.toString(16).padStart(2, "0");
+  return `#${t(h(1, 3))}${t(h(3, 5))}${t(h(5, 7))}`;
 }
 
 function HexCopyButton({ hex }: { hex: string }) {
@@ -243,57 +241,94 @@ function HexCopyButton({ hex }: { hex: string }) {
 }
 
 export default function UploadPage() {
-  const [imageUrl, setImageUrl] = useState<string | null>(null);
-  const [result, setResult] = useState<DetectedColor | null>(null);
+  const [imageUrl,  setImageUrl]  = useState<string | null>(null);
+  const [result,    setResult]    = useState<DetectedColor | null>(null);
+  const [dotPos,    setDotPos]    = useState<{ x: number; y: number } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
-  // Detected iris center in display (CSS) coordinates — for the overlay dot
-  const [irisCenter, setIrisCenter] = useState<{ x: number; y: number } | null>(null);
+  const [error,     setError]     = useState<string | null>(null);
+  const [isDragging,setIsDragging]= useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const imgRef = useRef<HTMLImageElement>(null);
+  const canvasRef    = useRef<HTMLCanvasElement>(null);
+  const imgRef       = useRef<HTMLImageElement>(null);
+  const pixelsRef    = useRef<Uint8ClampedArray | null>(null);
 
-  /**
-   * Core analysis routine. Always uses the auto-detected iris center,
-   * so the color never changes regardless of where the user clicks.
-   */
-  const analyzeImage = useCallback(async (canvas: HTMLCanvasElement) => {
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+  const handleFile = useCallback((file: File) => {
+    if (!file.type.match(/^image\/(jpeg|jpg|png|webp)$/)) {
+      alert("Please upload a JPG, PNG, or WebP image.");
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    setImageUrl(url);
+    setResult(null);
+    setDotPos(null);
+    setError(null);
+    pixelsRef.current = null;
+
+    const img = new Image();
+    img.onload = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width  = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      // Cache pixel data so we don't re-read it on every click
+      pixelsRef.current = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    };
+    img.src = url;
+  }, []);
+
+  const onDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  }, [handleFile]);
+
+  /** Called when user clicks anywhere on the eye image */
+  const handleImageClick = useCallback(async (e: React.MouseEvent<HTMLDivElement>) => {
+    const canvas = canvasRef.current;
+    const img    = imgRef.current;
+    const pixels = pixelsRef.current;
+    if (!canvas || !img || !pixels || isLoading) return;
+
+    // Map display click → canvas pixel coordinates
+    const rect     = img.getBoundingClientRect();
+    const displayX = e.clientX - rect.left;
+    const displayY = e.clientY - rect.top;
+    const scaleX   = canvas.width  / rect.width;
+    const scaleY   = canvas.height / rect.height;
+    const clickX   = Math.round(displayX * scaleX);
+    const clickY   = Math.round(displayY * scaleY);
 
     setResult(null);
     setError(null);
     setIsLoading(true);
 
     try {
-      // Step 1: Get all pixel data once
-      const fullData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const pixels = fullData.data;
+      // Step 1: Find the actual pupil center near where the user clicked
+      const { x: pupilX, y: pupilY } = findLocalPupilCenter(
+        pixels, clickX, clickY, canvas.width, canvas.height,
+      );
 
-      // Step 2: Auto-detect the pupil/iris center
-      const { x: pupilX, y: pupilY } = findPupilCenter(pixels, canvas.width, canvas.height);
+      // Show dot at the refined pupil center (in display coords)
+      setDotPos({
+        x: (pupilX / canvas.width)  * rect.width,
+        y: (pupilY / canvas.height) * rect.height,
+      });
 
-      // Convert canvas coords → display coords for the overlay dot
-      const img = imgRef.current;
-      if (img) {
-        const rect = img.getBoundingClientRect();
-        const displayX = (pupilX / canvas.width) * rect.width;
-        const displayY = (pupilY / canvas.height) * rect.height;
-        setIrisCenter({ x: displayX, y: displayY });
-      }
-
-      // Step 3: Sample the iris ring around the auto-detected center
+      // Step 2: Sample the iris ring around the pupil
       const sampledHex = sampleIrisPixels(pixels, pupilX, pupilY, canvas.width, canvas.height);
 
-      // Step 4: Crop region around iris and send to AI for descriptive name
+      // Step 3: Send cropped iris region to AI for descriptive name
       const imageData = cropIrisRegion(canvas, pupilX, pupilY);
 
       const res = await fetch("/api/analyze-eye", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageData, sampledHex }),
+        body:    JSON.stringify({ imageData, sampledHex }),
       });
 
       if (!res.ok) throw new Error(`Server error ${res.status}`);
@@ -301,62 +336,19 @@ export default function UploadPage() {
       setResult(data);
     } catch (err) {
       console.error(err);
-      setError("Could not detect eye colour. Please use a clear, close-up eye photo.");
+      setError("Could not detect colour. Try clicking directly on the iris.");
     } finally {
       setIsLoading(false);
     }
-  }, []);
-
-  const handleFile = useCallback(
-    (file: File) => {
-      if (!file.type.match(/^image\/(jpeg|jpg|png|webp)$/)) {
-        alert("Please upload a JPG, PNG, or WebP image.");
-        return;
-      }
-      const url = URL.createObjectURL(file);
-      setImageUrl(url);
-      setResult(null);
-      setIrisCenter(null);
-      setError(null);
-
-      const img = new Image();
-      img.onload = () => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(img, 0, 0);
-        // Auto-analyze immediately once image is painted
-        analyzeImage(canvas);
-      };
-      img.src = url;
-    },
-    [analyzeImage],
-  );
-
-  const onDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setIsDragging(false);
-      const file = e.dataTransfer.files[0];
-      if (file) handleFile(file);
-    },
-    [handleFile],
-  );
+  }, [isLoading]);
 
   const reset = () => {
     setImageUrl(null);
     setResult(null);
-    setIrisCenter(null);
+    setDotPos(null);
     setError(null);
+    pixelsRef.current = null;
     if (fileInputRef.current) fileInputRef.current.value = "";
-  };
-
-  const reanalyze = () => {
-    const canvas = canvasRef.current;
-    if (canvas && !isLoading) analyzeImage(canvas);
   };
 
   const matchedColor = result ? eyeColors.find((c) => c.id === result.id) : null;
@@ -375,7 +367,7 @@ export default function UploadPage() {
               <Camera className="w-5 h-5 text-gray-700" />
               <h1 className="text-xl font-black text-gray-900">AI Iris Analysis — Exact Eye Colour Detection</h1>
             </div>
-            <p className="text-gray-400 text-sm">Pixel-precise colour · Powered by GPT-4o Vision · Auto-detects iris automatically</p>
+            <p className="text-gray-400 text-sm">Pixel-precise colour · Powered by GPT-4o Vision · Click on the iris to detect</p>
           </div>
           <div className="p-6">
             <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-4">Reference Eye Colors</p>
@@ -394,7 +386,7 @@ export default function UploadPage() {
         <div className="flex items-start gap-3 bg-blue-50 border border-blue-200 rounded-2xl p-4 mb-6 text-sm text-blue-700">
           <Info className="w-5 h-5 flex-shrink-0 mt-0.5 text-blue-500" />
           <div>
-            <strong>Auto-detection:</strong> The app automatically finds and scans the iris in your photo — no need to click precisely. Upload any clear eye photo and it detects the exact colour instantly.
+            <strong>How to use:</strong> Upload any clear eye photo, then click once on the iris. The app locates the pupil near your click, samples the iris ring pixels, and gets an exact hex colour — no matter where on the iris you click.
           </div>
         </div>
 
@@ -413,7 +405,7 @@ export default function UploadPage() {
                 <Upload className="w-12 h-12 text-orange-400 mx-auto mb-4" />
                 <p className="text-xl font-semibold text-gray-800 mb-2">Drop your eye image here</p>
                 <p className="text-gray-400 text-sm mb-2">or click to browse</p>
-                <p className="text-xs text-gray-300">Supports JPG, PNG, WebP — any clear eye photo works</p>
+                <p className="text-xs text-gray-300">JPG, PNG, WebP · Close-up eye photos work best</p>
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -429,7 +421,11 @@ export default function UploadPage() {
 
                 {/* Image panel */}
                 <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
-                  <div className="relative">
+                  <div
+                    className="relative"
+                    style={{ cursor: isLoading ? "wait" : "crosshair" }}
+                    onClick={handleImageClick}
+                  >
                     <img
                       ref={imgRef}
                       src={imageUrl}
@@ -438,11 +434,11 @@ export default function UploadPage() {
                       draggable={false}
                     />
 
-                    {/* Detected iris center dot */}
-                    {irisCenter && (
+                    {/* Dot at detected pupil center */}
+                    {dotPos && (
                       <div
                         className="absolute pointer-events-none"
-                        style={{ left: irisCenter.x, top: irisCenter.y, transform: "translate(-50%, -50%)" }}
+                        style={{ left: dotPos.x, top: dotPos.y, transform: "translate(-50%,-50%)" }}
                       >
                         {isLoading ? (
                           <div className="w-10 h-10 rounded-full bg-white/90 shadow-lg flex items-center justify-center">
@@ -463,12 +459,12 @@ export default function UploadPage() {
                       </div>
                     )}
 
-                    {/* Scanning overlay while loading */}
-                    {isLoading && !irisCenter && (
+                    {/* Overlay hint before first click */}
+                    {!dotPos && !isLoading && (
                       <div className="absolute inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[1px] pointer-events-none">
                         <div className="bg-white/95 rounded-2xl px-5 py-3 shadow-lg flex items-center gap-2 text-sm font-semibold text-gray-800">
-                          <ScanEye className="w-4 h-4 text-orange-500 animate-pulse" />
-                          Auto-detecting iris…
+                          <MousePointer className="w-4 h-4 text-orange-500" />
+                          Click on the iris to detect colour
                         </div>
                       </div>
                     )}
@@ -476,29 +472,16 @@ export default function UploadPage() {
 
                   <div className="p-4 flex items-center justify-between">
                     <p className="text-gray-400 text-sm">
-                      {isLoading ? "Scanning pixels & naming with AI…" : irisCenter ? "Iris auto-detected" : ""}
+                      {isLoading ? "Finding iris & reading pixels…" : dotPos ? "Click again to re-detect" : "Waiting for click"}
                     </p>
-                    <div className="flex items-center gap-3">
-                      {!isLoading && result && (
-                        <div
-                          role="button"
-                          tabIndex={0}
-                          onClick={reanalyze}
-                          onKeyDown={(e) => e.key === "Enter" && reanalyze()}
-                          className="flex items-center gap-1.5 text-xs text-orange-500 hover:text-orange-700 transition cursor-pointer font-semibold"
-                        >
-                          <ScanEye className="w-3.5 h-3.5" /> Re-scan
-                        </div>
-                      )}
-                      <div
-                        role="button"
-                        tabIndex={0}
-                        onClick={reset}
-                        onKeyDown={(e) => e.key === "Enter" && reset()}
-                        className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-700 transition cursor-pointer"
-                      >
-                        <RefreshCw className="w-3.5 h-3.5" /> New image
-                      </div>
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={reset}
+                      onKeyDown={(e) => e.key === "Enter" && reset()}
+                      className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-700 transition cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" /> New image
                     </div>
                   </div>
                 </div>
@@ -512,8 +495,8 @@ export default function UploadPage() {
                   {isLoading && !result && (
                     <div className="bg-white border border-gray-200 rounded-3xl shadow-sm p-10 flex flex-col items-center justify-center text-center flex-1 min-h-64">
                       <Loader2 className="w-10 h-10 text-orange-400 animate-spin mb-4" />
-                      <p className="text-gray-700 font-semibold">Scanning iris pixels…</p>
-                      <p className="text-gray-400 text-sm mt-1">Auto-locating iris and reading exact colour</p>
+                      <p className="text-gray-700 font-semibold">Sampling iris pixels…</p>
+                      <p className="text-gray-400 text-sm mt-1">Getting exact colour from your image</p>
                     </div>
                   )}
 
@@ -525,19 +508,14 @@ export default function UploadPage() {
                       className="bg-white border-2 rounded-3xl shadow-sm overflow-hidden"
                       style={{ borderColor: result.hex }}
                     >
-                      {/* Gradient swatch — exact detected colour */}
+                      {/* Gradient swatch */}
                       <div
                         className="h-24 w-full relative flex items-end px-5 pb-3"
-                        style={{
-                          background: `linear-gradient(135deg, ${lightenHex(result.hex, 40)} 0%, ${result.hex} 60%, ${result.hex} 100%)`,
-                        }}
+                        style={{ background: `linear-gradient(135deg, ${lightenHex(result.hex, 40)} 0%, ${result.hex} 60%)` }}
                       >
                         <div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/25" />
                         <div className="relative z-10 flex items-center gap-3">
-                          <span
-                            className="w-8 h-8 rounded-full border-4 border-white/80 shadow-md flex-shrink-0"
-                            style={{ backgroundColor: result.hex }}
-                          />
+                          <span className="w-8 h-8 rounded-full border-4 border-white/80 shadow-md" style={{ backgroundColor: result.hex }} />
                           <div>
                             <p className="text-white text-xs font-semibold tracking-widest uppercase opacity-80">Exact Iris Colour</p>
                             <p className="text-white font-mono text-sm font-bold">{result.hex.toUpperCase()}</p>
@@ -559,7 +537,7 @@ export default function UploadPage() {
                           style={{ backgroundColor: result.hex }}
                         >
                           <Eye className="w-4 h-4" />
-                          Auto-detected · Named by GPT-4o
+                          Pixel-sampled · Named by GPT-4o
                         </div>
                       </div>
 
@@ -596,16 +574,16 @@ export default function UploadPage() {
 
                   {!result && !isLoading && !error && (
                     <div className="bg-white border border-gray-200 rounded-3xl shadow-sm p-10 flex flex-col items-center justify-center text-center flex-1 min-h-64">
-                      <ScanEye className="w-10 h-10 text-gray-200 mb-3" />
-                      <p className="text-gray-500 font-semibold">Ready to scan</p>
-                      <p className="text-gray-300 text-sm mt-1">Upload an eye photo to auto-detect iris colour</p>
+                      <MousePointer className="w-10 h-10 text-gray-200 mb-3" />
+                      <p className="text-gray-500 font-semibold">Click the iris</p>
+                      <p className="text-gray-300 text-sm mt-1">Click anywhere on or near the iris in the image</p>
                     </div>
                   )}
                 </div>
               </div>
 
               <p className="text-center text-xs text-gray-400">
-                Iris is auto-located from the image · Pixels sampled for exact hex · GPT-4o names the shade
+                Click anywhere on the iris · Pupil auto-located near your click · Pixels sampled for exact hex · GPT-4o names the shade
               </p>
             </motion.div>
           )}

@@ -7,6 +7,7 @@ import HomePage from "@/pages/HomePage";
 import InheritancePage from "@/pages/InheritancePage";
 import CountryPage from "@/pages/CountryPage";
 import UploadPage from "@/pages/UploadPage";
+import EyeDetailPage from "@/pages/EyeDetailPage";
 
 const queryClient = new QueryClient();
 
@@ -27,6 +28,7 @@ function Router() {
       <Navigation />
       <Switch>
         <Route path="/" component={HomePage} />
+        <Route path="/eye/:id" component={EyeDetailPage} />
         <Route path="/inheritance" component={InheritancePage} />
         <Route path="/country" component={CountryPage} />
         <Route path="/upload" component={UploadPage} />

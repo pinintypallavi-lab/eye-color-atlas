@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Open Eye Color Atlas",
+      "type": "pwa-chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/artifacts/eye-color-atlas/src",
+      "preLaunchTask": "Run Eye Color Atlas"
+    }
+  ]
+}
